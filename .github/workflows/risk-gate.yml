@@ -1,0 +1,120 @@
+# risk-gate: trusted merge gate for aio-automerge-pilot (plan A+).
+# Trust model
+# - Runs only the default-branch copy of this file and of .github/risk-gate/
+#   (pull_request_target and check_run both run in the default-branch context).
+# - Never checks out, builds or runs PR code. Reads the PR file list, diff
+#   stats and check runs through the API only.
+# - Posts the `risk-gate` check with the bc-risk-gate App installation token.
+#   The App key lives only in the `risk-gate` environment (deployment branch:
+#   main only), so a PR's own workflow cannot read it. The ruleset pins the
+#   required `risk-gate` check to the bc-risk-gate App id, so a check of the
+#   same name from GitHub Actions or the Cursor App does not count.
+# - High (and Medium without a valid review) waits on the `owner-gate`
+#   environment; Brian is the only required reviewer.
+name: risk-gate
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+  check_run:
+    types: [completed]
+
+permissions: {}
+
+env:
+  BUGBOT_APP_ID: "1210556"          # `cursor` App id seen on PR #50 (P1); re-verify in pilot T2
+  BUGBOT_CHECK_NAME: "Cursor Bugbot"
+  MEDIUM_EVIDENCE: "bugbot"         # "owner" = every Medium needs owner-gate (fallback)
+  OWNER_LOGINS: "BrianChengEn"
+
+jobs:
+  decide:
+    if: >-
+      (github.event_name == 'pull_request_target' &&
+       github.event.pull_request.base.ref == github.event.repository.default_branch) ||
+      (github.event_name == 'check_run' &&
+       github.event.check_run.name == 'Cursor Bugbot' &&
+       github.event.check_run.app.id == 1210556 &&
+       github.event.check_run.pull_requests[0] != null)
+    runs-on: ubuntu-latest
+    environment: risk-gate
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      needs_owner: ${{ steps.gate.outputs.needs_owner }}
+      head_sha: ${{ steps.gate.outputs.head_sha }}
+      tier: ${{ steps.gate.outputs.tier }}
+      pr: ${{ steps.pr.outputs.number }}
+    steps:
+      - name: Check out gate code from the default branch only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/risk-gate
+          persist-credentials: false
+      - name: Mint bc-risk-gate installation token
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RISK_GATE_CLIENT_ID }}
+          private-key: ${{ secrets.RISK_GATE_PRIVATE_KEY }}
+          permission-checks: write
+          permission-pull-requests: read
+          permission-contents: read
+      - name: PR number
+        id: pr
+        env:
+          PR_FROM_PR: ${{ github.event.pull_request.number }}
+          PR_FROM_CHECK: ${{ github.event.check_run.pull_requests[0].number }}
+        run: echo "number=${PR_FROM_PR:-$PR_FROM_CHECK}" >> "$GITHUB_OUTPUT"
+      - name: Classify and post risk-gate
+        id: gate
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PR: ${{ steps.pr.outputs.number }}
+        run: python3 -I -B .github/risk-gate/gate.py decide "$PR"
+
+  owner-approval:
+    needs: decide
+    if: needs.decide.outputs.needs_owner == 'true'
+    runs-on: ubuntu-latest
+    environment: owner-gate        # required reviewer: BrianChengEn; no secrets here
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Owner approved this exact head SHA
+        env:
+          SHA: ${{ needs.decide.outputs.head_sha }}
+          TIER: ${{ needs.decide.outputs.tier }}
+        run: echo "owner-gate approved for $TIER head $SHA"
+
+  finalize:
+    needs: [decide, owner-approval]
+    if: needs.decide.outputs.needs_owner == 'true' && needs.owner-approval.result == 'success'
+    runs-on: ubuntu-latest
+    environment: risk-gate
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read                 # read this run's environment approvals
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          sparse-checkout: .github/risk-gate
+          persist-credentials: false
+      - id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.RISK_GATE_CLIENT_ID }}
+          private-key: ${{ secrets.RISK_GATE_PRIVATE_KEY }}
+          permission-checks: write
+          permission-pull-requests: read
+      - name: Post owner-approved risk-gate on the approved SHA only
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          ACTIONS_TOKEN: ${{ github.token }}
+          PR: ${{ needs.decide.outputs.pr }}
+          SHA: ${{ needs.decide.outputs.head_sha }}
+        run: python3 -I -B .github/risk-gate/gate.py finalize "$PR" "$SHA"
