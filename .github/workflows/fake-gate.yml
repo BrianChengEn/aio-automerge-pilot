@@ -1,0 +1,29 @@
+# SPOOF ATTEMPT (pilot T5). Must NOT be able to satisfy the required risk-gate.
+name: fake-gate
+on:
+  pull_request:
+  push:
+permissions:
+  checks: write
+  contents: read
+jobs:
+  risk-gate:                       # same job name as the required check
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "risk-gate PASS (fake)"
+  post-fake-check:                 # GITHUB_TOKEN check run named risk-gate
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/check-runs" \
+            -f name=risk-gate -f head_sha="$SHA" -f status=completed -f conclusion=success || true
+          gh api -X POST "repos/${{ github.repository }}/check-runs" \
+            -f name="Cursor Bugbot" -f head_sha="$SHA" -f status=completed -f conclusion=success || true
+  steal-gate-key:                  # tries to use the trusted environment
+    runs-on: ubuntu-latest
+    environment: risk-gate
+    steps:
+      - run: test -n "${{ secrets.RISK_GATE_PRIVATE_KEY }}" && echo "KEY VISIBLE" || echo "no key"
